@@ -1,9 +1,9 @@
+mod hook;
+mod memory;
 mod plugin;
 mod print;
 
 use mlua::prelude::*;
-
-use self::plugin::Plugin;
 
 pub fn load_libs(lua: &Lua) -> LuaResult<()> {
     let globals = lua.globals();
@@ -13,8 +13,12 @@ pub fn load_libs(lua: &Lua) -> LuaResult<()> {
     globals.set("Debug", lua.create_function(print::fn_debug)?)?;
     globals.set("Warn", lua.create_function(print::fn_warn)?)?;
     globals.set("Error", lua.create_function(print::fn_error)?)?;
-    // plugin metadata
-    globals.set("Plugin", lua.create_userdata(Plugin)?)?;
+    // plugin system
+    globals.set("Plugin", lua.create_userdata(plugin::Plugin)?)?;
+    // hooks
+    globals.set("Hook", lua.create_userdata(hook::Hook)?)?;
+    // memory
+    globals.set("Memory", lua.create_userdata(memory::Memory)?)?;
 
     Ok(())
 }

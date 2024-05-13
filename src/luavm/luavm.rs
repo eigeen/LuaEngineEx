@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use log::debug;
 use mlua::prelude::*;
 use snafu::prelude::*;
 
@@ -15,12 +16,14 @@ pub enum LuaVMError {
     LuaRuntime { source: mlua::Error },
 }
 
+#[derive(Debug)]
 pub struct LuaVMData {
     pub name: String,
     pub file_path: Option<String>,
     pub script: Option<String>,
 }
 
+#[derive(Debug)]
 pub struct LuaVM {
     pub data: LuaVMData,
     lua: mlua::Lua,
@@ -55,6 +58,7 @@ impl LuaVM {
         }
 
         let script = &self.data.script.as_ref().unwrap();
+        debug!("Lua VM \"{}\" start running", self.data.name);
         self.run_inner(script)
             .map_err(|e| LuaVMError::LuaRuntime { source: e })?;
 
@@ -68,6 +72,17 @@ impl LuaVM {
         let script = std::fs::read_to_string(&file_path).context(LoadFileSnafu)?;
         self.data.file_path = Some(file_path.as_ref().to_string_lossy().to_string());
         self.data.script = Some(script);
+
+        Ok(())
+    }
+
+    pub fn reload(&mut self) -> Result<(), LuaVMError> {
+        if self.data.file_path.is_none() {
+            return Err(LuaVMError::NotLoaded);
+        }
+        let file_path = self.data.file_path.clone().unwrap();
+        self.load_file(file_path)?;
+        self.run()?;
 
         Ok(())
     }
