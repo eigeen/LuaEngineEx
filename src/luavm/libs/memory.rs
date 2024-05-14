@@ -10,6 +10,7 @@ impl UserData for Memory {
     }
 }
 
+/// RawPtr provides a reference of a specified memory
 pub struct RawPtr {
     base: usize,
     offsets: Vec<isize>,
@@ -51,69 +52,56 @@ impl UserData for RawPtr {
                     .map(mlua::Value::Number),
                 TypeName::F64 => this.get_copy::<f64>().map(mlua::Value::Number),
                 TypeName::Bool => this.get_copy::<bool>().map(mlua::Value::Boolean),
-                TypeName::String => unimplemented!(),
+                TypeName::String => todo!(),
             }
             .ok_or(LuaError::RuntimeError("Failed to get value".to_string()))
         });
-        methods.add_method("write", |_, this, args: mlua::Variadic<mlua::Value>| {
-            // :write(value: Value, typeName: Option<String>)
-            if args.len() < 1 {
-                return Err(LuaError::RuntimeError("At least one parameter must be provided. The current number of parameters is 0".to_string()));
+        methods.add_method("write", |_, this, (value, type_name): (mlua::Value, Option<String>)| {
+            match type_name {
+                Some(type_name) => {
+                    let type_sig = TypeName::from_str(&type_name).ok_or(LuaError::RuntimeError(format!("Invalid type name: {}", type_name)))?;
+                    match value {
+                        LuaValue::Boolean(v) => {
+                            this.set_value::<bool>(v).map_err(|e| LuaError::RuntimeError(e.to_string()))
+                        },
+                        // Integer values support only integers, while Number values support both integers and floats.
+                        LuaValue::Integer(v) => {
+                            match type_sig {
+                                TypeName::I8 => this.set_value(v as i8).map_err(|e| LuaError::RuntimeError(e.to_string())),
+                                TypeName::I16 => this.set_value(v as i16).map_err(|e| LuaError::RuntimeError(e.to_string())),
+                                TypeName::I32 => this.set_value(v as i32).map_err(|e| LuaError::RuntimeError(e.to_string())),
+                                TypeName::I64 => this.set_value(v).map_err(|e| LuaError::RuntimeError(e.to_string())),
+                                _ => Err(LuaError::RuntimeError(format!("The type of the value is {:?}, while `typeName` is {:?}, does not match", value ,type_name))),
+                            }
+                        },
+                        LuaValue::Number(v) => {
+                            match type_sig {
+                                TypeName::I8 => this.set_value(v as i8).map_err(|e| LuaError::RuntimeError(e.to_string())),
+                                TypeName::I16 => this.set_value(v as i16).map_err(|e| LuaError::RuntimeError(e.to_string())),
+                                TypeName::I32 => this.set_value(v as i32).map_err(|e| LuaError::RuntimeError(e.to_string())),
+                                TypeName::I64 => this.set_value(v as i64).map_err(|e| LuaError::RuntimeError(e.to_string())),
+                                TypeName::F32 => this.set_value(v as f32).map_err(|e| LuaError::RuntimeError(e.to_string())),
+                                TypeName::F64 => this.set_value(v).map_err(|e| LuaError::RuntimeError(e.to_string())),
+                                _ => Err(LuaError::RuntimeError(format!("The type of the value is {:?}, while `typeName` is {:?}, does not match", value ,type_name))),
+                            }
+                        },
+                        LuaValue::String(_) => unimplemented!(),
+                        _ => Err(LuaError::RuntimeError(format!("Unsupported value type: {}", value.type_name())))
+                    }
+                }
+                None => {
+                    match value {
+                        LuaValue::Boolean(v) => {
+                            this.set_value(v).map_err(|e| LuaError::RuntimeError(e.to_string()))
+                        },
+                        // Integer values support only integers, while Number values support both integers and floats.
+                        LuaValue::Integer(_) => Err(LuaError::RuntimeError("Integer value must provide `typeName` argument, such as i32, i64, etc.".to_string())),
+                        LuaValue::Number(_) => Err(LuaError::RuntimeError("Number value must provide `typeName` argument, such as i32, f32, etc.".to_string())),
+                        LuaValue::String(_) => todo!(),
+                        _ => Err(LuaError::RuntimeError(format!("Unsupported value type: {}", value.type_name())))
+                    }
+                }
             }
-            if args.len() < 2 {
-                // only value is provided
-                let value = args.first().unwrap();
-                return match value {
-                    LuaValue::Boolean(v) => {
-                        this.set_value(*v).map_err(|e| LuaError::RuntimeError(e.to_string()))
-                    },
-                    // Integer values support only integers, while Number values support both integers and floats.
-                    LuaValue::Integer(_) => Err(LuaError::RuntimeError("Integer value must provide `typeName` argument, such as i32, i64, etc.".to_string())),
-                    LuaValue::Number(_) => Err(LuaError::RuntimeError("Number value must provide `typeName` argument, such as i32, f32, etc.".to_string())),
-                    LuaValue::String(_) => unimplemented!(),
-                    _ => Err(LuaError::RuntimeError(format!("Unsupported value type: {}", value.type_name())))
-                };
-            }
-            if args.len() < 3 {
-                // value + typeName
-                let value = args.first().unwrap();
-                let type_name_value = args.get(1).unwrap();
-                let type_name = type_name_value.to_string().map_err(|_| LuaError::RuntimeError("`typeName` must be able to be converted to string".to_string()))?;
-                let type_name = TypeName::from_str(&type_name).ok_or(LuaError::RuntimeError(format!(
-                    "Invalid type_name: {}, consider using i32, i64, f32, etc.",
-                    type_name
-                )))?;
-                return match value {
-                    LuaValue::Boolean(v) => {
-                        this.set_value::<bool>(*v).map_err(|e| LuaError::RuntimeError(e.to_string()))
-                    },
-                    // Integer values support only integers, while Number values support both integers and floats.
-                    LuaValue::Integer(v) => {
-                        match type_name {
-                            TypeName::I8 => this.set_value(*v as i8).map_err(|e| LuaError::RuntimeError(e.to_string())),
-                            TypeName::I16 => this.set_value(*v as i16).map_err(|e| LuaError::RuntimeError(e.to_string())),
-                            TypeName::I32 => this.set_value(*v as i32).map_err(|e| LuaError::RuntimeError(e.to_string())),
-                            TypeName::I64 => this.set_value(*v).map_err(|e| LuaError::RuntimeError(e.to_string())),
-                            _ => Err(LuaError::RuntimeError(format!("The type of the value is {:?}, while `typeName` is {:?}, does not match", value ,type_name))),
-                        }
-                    },
-                    LuaValue::Number(v) => {
-                        match type_name {
-                            TypeName::I8 => this.set_value(*v as i8).map_err(|e| LuaError::RuntimeError(e.to_string())),
-                            TypeName::I16 => this.set_value(*v as i16).map_err(|e| LuaError::RuntimeError(e.to_string())),
-                            TypeName::I32 => this.set_value(*v as i32).map_err(|e| LuaError::RuntimeError(e.to_string())),
-                            TypeName::I64 => this.set_value(*v as i64).map_err(|e| LuaError::RuntimeError(e.to_string())),
-                            TypeName::F32 => this.set_value(*v as f32).map_err(|e| LuaError::RuntimeError(e.to_string())),
-                            TypeName::F64 => this.set_value(*v).map_err(|e| LuaError::RuntimeError(e.to_string())),
-                            _ => Err(LuaError::RuntimeError(format!("The type of the value is {:?}, while `typeName` is {:?}, does not match", value ,type_name))),
-                        }
-                    },
-                    LuaValue::String(_) => unimplemented!(),
-                    _ => Err(LuaError::RuntimeError(format!("Unsupported value type: {}", value.type_name())))
-                };
-            }
-
-            Ok(())
         });
     }
 }

@@ -1,10 +1,12 @@
-use std::path::Path;
+use std::{path::Path, sync::{Arc, Mutex}};
 
 use log::debug;
 use mlua::prelude::*;
 use snafu::prelude::*;
 
 use super::libs;
+
+pub type SharedLua = Arc<Mutex<Lua>>;
 
 #[derive(Debug, Snafu)]
 pub enum LuaVMError {
@@ -26,7 +28,7 @@ pub struct LuaVMData {
 #[derive(Debug)]
 pub struct LuaVM {
     pub data: LuaVMData,
-    lua: mlua::Lua,
+    lua: SharedLua,
 }
 
 impl LuaVM {
@@ -37,19 +39,19 @@ impl LuaVM {
                 file_path: None,
                 script: None,
             },
-            lua: Lua::new(),
+            lua: Arc::new(Mutex::new(Lua::new())),
         }
     }
 
     fn run_inner(&self, script: &str) -> LuaResult<()> {
         self.load_libs()?;
-        self.lua.load(script).exec()?;
+        self.lua.lock().unwrap().load(script).exec()?;
 
         Ok(())
     }
 
     fn load_libs(&self) -> LuaResult<()> {
-        libs::load_libs(&self.lua)
+        libs::load_libs(self.lua.clone())
     }
 
     pub fn run(&self) -> Result<(), LuaVMError> {

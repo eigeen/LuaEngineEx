@@ -4,9 +4,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Once};
 use std::thread;
 
-use clap::Parser;
 use log::{debug, error, info};
 use luavm::{LuaVM, LuaVMError};
+use mhw_toolkit::game::hooks::{CallbackPosition, HookHandle};
 use snafu::prelude::*;
 use std::sync::Mutex as StdMutex;
 use winapi::shared::minwindef::{BOOL, DWORD, HINSTANCE, LPVOID, TRUE};
@@ -141,15 +141,20 @@ async fn lua_main() -> Result<(), Error> {
 
     // in game chat command listener
     let vm_manager1 = vm_manager.clone();
-    mhw_toolkit::game::hooks::hook_input_dispatch(move |input| {
-        if input.starts_with("/lua ") {
+    let mut hook_input_dispatch = mhw_toolkit::game::hooks::InputDispatchHook::new();
+    hook_input_dispatch
+        .set_hook(CallbackPosition::Before, move |input| {
+            if !input.starts_with("/lua ") {
+                return;
+            }
+
             let inputs = input.split_whitespace().collect::<Vec<&str>>();
             if inputs.len() < 2 {
                 return;
             }
             debug!("user command: {:?}", inputs);
             if inputs[1] == "debug" {
-                debug!("vm: {:#?}", vm_manager1.lock().unwrap().vm);
+                // debug!("vm: {:#?}", vm_manager1.lock().unwrap().vm);
             } else if inputs[1] == "reload" {
                 if inputs.len() < 3 {
                     // reload all
@@ -167,37 +172,10 @@ async fn lua_main() -> Result<(), Error> {
                     }
                 }
             }
-            // match command::Cli::try_parse_from(inputs) {
-            //     Ok(cli) => match cli.command {
-            //         command::Command::Reload { script } => match script {
-            //             Some(script) => {
-            //                 if let Err(e) = vm_manager1.lock().unwrap().reload(&script) {
-            //                     error!("reload error: {}", e);
-            //                 }
-            //             }
-            //             None => {
-            //                 if let Err(e) = vm_manager1.lock().unwrap().reload_all() {
-            //                     error!("reload error: {}", e);
-            //                 }
-            //             }
-            //         },
-            //         command::Command::Debug { command } => {
-            //             match command {
-            //                 command::DebugCommand::Vm => {
-            //                     debug!("vm: {:#?}", vm_manager1.lock().unwrap().vm);
-            //                 },
-            //             }
-            //         },
-            //     },
-            //     Err(e) => {
-            //         error!("{}", e);
-            //     }
-            // }
-        }
-    })
-    .map_err(|e| Error::Hook {
-        reason: e.to_string(),
-    })?;
+        })
+        .map_err(|e| Error::Hook {
+            reason: e.to_string(),
+        })?;
 
     vm_manager.lock().unwrap().load_all()?;
     vm_manager.lock().unwrap().run_all()?;
@@ -212,7 +190,11 @@ fn main_entry() -> Result<(), Error> {
         .enable_all()
         .build()
         .context(IoSnafu)?;
-    runtime.block_on(lua_main())?;
+    let _ = runtime.block_on(async {
+        tokio::spawn(async move { lua_main().await });
+
+        tokio::signal::ctrl_c().await
+    });
 
     Ok(())
 }
