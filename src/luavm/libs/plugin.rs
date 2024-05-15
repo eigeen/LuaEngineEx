@@ -1,23 +1,34 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
 use log::error;
+use mhw_toolkit::game::hooks::{CallbackPosition, HookHandle, MonsterCtorHook, MonsterDtorHook};
 use mlua::prelude::*;
 use mlua::UserData;
 use rand::RngCore;
+use tokio::runtime::Handle;
+use tokio::sync::Mutex;
 
-use crate::luavm::SharedLua;
+use crate::luavm::LuaVM;
+use crate::luavm::WeakLuaVM;
 
 type EventFuncs = Vec<(u64, mlua::RegistryKey)>;
 
+#[derive(Clone)]
 pub struct Plugin {
-    /// event callback functions
+    /// event callback functions \
+    /// key: event type, value: Vec<(id, func_reg_key)>
     event_listeners: Arc<Mutex<HashMap<EventType, EventFuncs>>>,
+    /// setInterval callback functions \
+    /// key: interval(ms), value: Vec<(id, func_reg_key)>
+    interval_listeners: Arc<Mutex<HashMap<u64, EventFuncs>>>,
 
-    lua: SharedLua,
+    monster_ctor_hook: Arc<Mutex<MonsterCtorHook>>,
+    monster_dtor_hook: Arc<Mutex<MonsterDtorHook>>,
+
+    luavm: WeakLuaVM,
 }
 
 impl UserData for Plugin {
@@ -27,59 +38,148 @@ impl UserData for Plugin {
     }
 
     fn add_methods<'lua, M: LuaUserDataMethods<'lua, Self>>(methods: &mut M) {
-        methods.add_method_mut(
+        methods.add_async_method_mut(
             "addEventListener",
-            |lua, this, (event_type_name, f): (String, mlua::Function)| {
+            |lua, this, (event_type_name, f): (String, mlua::Function)| async move {
                 let event_type = EventType::from_str(&event_type_name).ok_or(LuaError::runtime(
                     format!("Invalid event type: {}", event_type_name),
                 ))?;
+                // special case
+                match event_type {
+                    EventType::OnMonsterCreate => {
+                        let mut hook = this.monster_ctor_hook.lock().await;
+                        if !hook.is_hooked() {
+                            let p = this.clone();
+                            let handle = Handle::current();
+                            if let Err(e) =
+                                hook.set_hook(CallbackPosition::Before, move |(m, _, _)| {
+                                    handle.block_on(async {
+                                        if let Err(e) = p
+                                            .dispatch_event_monster(
+                                                EventType::OnMonsterCreate,
+                                                m as i64,
+                                            )
+                                            .await
+                                        {
+                                            error!("Error in OnMonsterCreate event: {}", e)
+                                        };
+                                    })
+                                })
+                            {
+                                error!("Error in OnMonsterCreate hook: {}", e)
+                            }
+                        };
+                    }
+                    EventType::OnMonsterDestroy => {
+                        let mut hook = this.monster_dtor_hook.lock().await;
+                        if !hook.is_hooked() {
+                            let p = this.clone();
+                            let handle = Handle::current();
+                            if let Err(e) = hook.set_hook(CallbackPosition::Before, move |m| {
+                                handle.block_on(async {
+                                    if let Err(e) = p
+                                        .dispatch_event_monster(
+                                            EventType::OnMonsterDestroy,
+                                            m as i64,
+                                        )
+                                        .await
+                                    {
+                                        error!("Error in OnMonsterDestroy event: {}", e)
+                                    };
+                                })
+                            }) {
+                                error!("Error in OnMonsterDestroy hook: {}", e)
+                            }
+                        };
+                    }
+                    _ => (),
+                };
+
                 let func_reg_key = lua.create_registry_value(f)?;
                 let id = rand::thread_rng().next_u64();
                 this.event_listeners
                     .lock()
-                    .unwrap()
+                    .await
                     .entry(event_type)
                     .or_default()
                     .push((id, func_reg_key));
 
                 Ok(id)
             },
-        )
-    }
-}
+        );
+        methods.add_async_method_mut(
+            "setInterval",
+            |lua, this, (f, interval): (mlua::Function, u64)| async move {
+                let func_reg_key = lua.create_registry_value(f)?;
+                let id = rand::thread_rng().next_u64();
+                let mut listeners = this.interval_listeners.lock().await;
+                if listeners.get(&interval).is_none() {
+                    start_set_interval(this.clone(), interval);
+                };
+                listeners
+                    .entry(interval)
+                    .or_default()
+                    .push((id, func_reg_key));
 
-impl Clone for Plugin {
-    fn clone(&self) -> Self {
-        Self {
-            event_listeners: self.event_listeners.clone(),
-            lua: self.lua.clone(),
-        }
+                Ok(id)
+            },
+        );
     }
 }
 
 impl Plugin {
-    pub fn new(lua: SharedLua) -> Plugin {
+    pub fn new(luavm: WeakLuaVM) -> Plugin {
         Plugin {
             event_listeners: Arc::new(Mutex::new(HashMap::new())),
-            lua,
+            interval_listeners: Arc::new(Mutex::new(HashMap::new())),
+            luavm,
+            monster_ctor_hook: Arc::new(Mutex::new(MonsterCtorHook::new())),
+            monster_dtor_hook: Arc::new(Mutex::new(MonsterDtorHook::new())),
         }
     }
 
-    pub fn dispatch_standalone_tick(&self) -> Result<(), mlua::Error> {
-        if let Some(event_funcs) = self
-            .event_listeners
-            .lock()
-            .unwrap()
-            .get(&EventType::StandaloneTick)
-        {
+    pub fn get_luavm(&self) -> Option<Arc<Mutex<LuaVM>>> {
+        self.luavm.upgrade()
+    }
+
+    pub async fn dispatch_set_interval(&self, interval: u64) -> Result<(), mlua::Error> {
+        if let Some(interval_funcs) = self.interval_listeners.lock().await.get(&interval) {
+            if interval_funcs.is_empty() {
+                return Ok(());
+            }
+            if let Some(luavm) = self.get_luavm() {
+                let luavm_ = luavm.lock().await;
+                if !luavm_.is_running() {
+                    return Ok(());
+                }
+                for (_, func_reg_key) in interval_funcs {
+                    let f: mlua::Function = luavm_.lua.registry_value(func_reg_key)?;
+                    f.call_async::<_, ()>(()).await?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn dispatch_event_monster<'a>(
+        &self,
+        event_type: EventType,
+        arg: i64,
+    ) -> Result<(), mlua::Error> {
+        if let Some(event_funcs) = self.event_listeners.lock().await.get(&event_type) {
             if event_funcs.is_empty() {
                 return Ok(());
             }
-
-            let lua_ = self.lua.lock().unwrap();
-            for (_, func_reg_key) in event_funcs {
-                let f: mlua::Function = lua_.registry_value(func_reg_key)?;
-                f.call::<_, ()>(())?;
+            if let Some(luavm) = self.get_luavm() {
+                let luavm = luavm.lock().await;
+                if !luavm.is_running() {
+                    return Ok(());
+                }
+                for (_, func_reg_key) in event_funcs {
+                    let f: mlua::Function = luavm.lua.registry_value(func_reg_key)?;
+                    f.call_async::<_, ()>(arg).await?;
+                }
             }
         }
 
@@ -88,25 +188,32 @@ impl Plugin {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum EventType {
-    StandaloneTick,
+pub enum EventType {
+    OnMonsterCreate,
+    OnMonsterDestroy,
 }
 
 impl EventType {
     pub fn from_str(s: &str) -> Option<EventType> {
         match s {
-            "StandaloneTick" => Some(EventType::StandaloneTick),
+            "OnMonsterCreate" => Some(EventType::OnMonsterCreate),
+            "OnMonsterDestroy" => Some(EventType::OnMonsterDestroy),
             _ => None,
         }
     }
 }
 
-pub fn start_standalone_ticker(p: Plugin) {
-    thread::spawn(move || loop {
-        if let Err(e) = p.dispatch_standalone_tick() {
-            error!("Error in standalone ticker: {}", e);
-            return;
-        }
-        thread::sleep(Duration::from_millis((1000.0 / 60.0) as u64))
+pub fn start_set_interval(p: Plugin, interval: u64) {
+    let handle = Handle::current();
+    thread::spawn(move || {
+        handle.block_on(async {
+            while p.get_luavm().is_some() {
+                if let Err(e) = p.dispatch_set_interval(interval).await {
+                    error!("Error in setInterval: {}", e);
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(interval)).await;
+            }
+        })
     });
 }

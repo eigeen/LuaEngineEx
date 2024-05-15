@@ -1,14 +1,16 @@
 #![allow(non_snake_case)]
 
 use std::collections::HashMap;
+use std::f32::consts::E;
 use std::sync::{Arc, Once};
 use std::thread;
 
 use log::{debug, error, info};
-use luavm::{LuaVM, LuaVMError};
+use luavm::{LuaHandler, LuaVMError};
 use mhw_toolkit::game::hooks::{CallbackPosition, HookHandle};
 use snafu::prelude::*;
-use std::sync::Mutex as StdMutex;
+use tokio::runtime::Handle;
+use tokio::sync::{mpsc, Mutex};
 use winapi::shared::minwindef::{BOOL, DWORD, HINSTANCE, LPVOID, TRUE};
 use winapi::um::winnt::{DLL_PROCESS_ATTACH, DLL_PROCESS_DETACH};
 
@@ -41,24 +43,24 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 enum Error {
     #[snafu(display("Lua error: {}", source))]
     LuaVM { source: LuaVMError },
-    #[snafu(display("Hook error: {}", reason))]
-    Hook { reason: String },
+    #[snafu(display("Hook error: {}", source))]
+    Hook { source: hooks::HookError },
     #[snafu(display("IO error: {}", source))]
     Io { source: std::io::Error },
     #[snafu(display("Error: {}", reason))]
     User { reason: String },
 }
 
-struct LuaVMManager {
-    vm: HashMap<String, LuaVM>,
+struct LuaManager {
+    vm: HashMap<String, LuaHandler>,
 }
 
-impl LuaVMManager {
+impl LuaManager {
     pub fn new() -> Self {
         Self { vm: HashMap::new() }
     }
 
-    pub fn load_all(&mut self) -> Result<()> {
+    pub async fn load_all(&mut self) -> Result<()> {
         for entry in std::fs::read_dir("LuaEngineEx").context(IoSnafu)? {
             let entry = entry.context(IoSnafu)?;
             let path = entry.path();
@@ -66,10 +68,11 @@ impl LuaVMManager {
                 if let Some(ext) = path.extension() {
                     if ext == "lua" {
                         debug!("loading lua file: {}", path.display());
-                        let mut vm = LuaVM::new(path.file_name().unwrap().to_str().unwrap());
-                        vm.load_file(&path).context(LuaVMSnafu)?;
-                        debug!("Lua VM {} loaded", vm.data.name);
-                        self.vm.insert(vm.data.name.clone(), vm);
+                        let mut vm = LuaHandler::new(path.file_name().unwrap().to_str().unwrap());
+                        vm.load_file(&path).await.context(LuaVMSnafu)?;
+                        let name = vm.data.lock().await.name.clone();
+                        debug!("Lua VM {} loaded", name);
+                        self.vm.insert(name, vm);
                     }
                 }
             }
@@ -83,9 +86,9 @@ impl LuaVMManager {
         self.vm.clear();
     }
 
-    pub fn run_all(&self) -> Result<()> {
+    pub async fn run_all(&self) -> Result<()> {
         for vm in self.vm.values() {
-            vm.run().context(LuaVMSnafu)?;
+            vm.run().await.context(LuaVMSnafu)?;
         }
 
         Ok(())
@@ -98,11 +101,11 @@ impl LuaVMManager {
         Ok(())
     }
 
-    pub fn reload(&mut self, name: &str) -> Result<()> {
+    pub async fn reload(&mut self, name: &str) -> Result<()> {
         // find in scheduler
         if self.vm.contains_key(name) {
             let vm = self.vm.get_mut(name).unwrap();
-            match vm.reload() {
+            match vm.reload().await {
                 Ok(_) => return Ok(()),
                 Err(e) => {
                     return Err(Error::LuaVM { source: e });
@@ -115,9 +118,10 @@ impl LuaVMManager {
             let path = entry.path();
             if path.is_file() && path.file_name().unwrap().to_str().unwrap() == name {
                 debug!("loading lua file: {}", path.display());
-                let mut vm = LuaVM::new(path.file_name().unwrap().to_str().unwrap());
-                vm.load_file(&path).context(LuaVMSnafu)?;
-                self.vm.insert(vm.data.name.clone(), vm);
+                let mut vm = LuaHandler::new(path.file_name().unwrap().to_str().unwrap());
+                vm.load_file(&path).await.context(LuaVMSnafu)?;
+                let name = vm.data.lock().await.name.clone();
+                self.vm.insert(name, vm);
                 break;
             }
         }
@@ -127,20 +131,25 @@ impl LuaVMManager {
         })
     }
 
-    pub fn reload_all(&mut self) -> Result<()> {
+    pub async fn reload_all(&mut self) -> Result<()> {
         self.unload_all();
-        self.load_all()?;
-        self.run_all()?;
+        self.load_all().await?;
+        self.run_all().await?;
 
         Ok(())
     }
 }
 
-async fn lua_main() -> Result<(), Error> {
-    let vm_manager = Arc::new(StdMutex::new(LuaVMManager::new()));
+#[derive(Clone)]
+pub enum ManagerEvent {
+    ReloadAll,
+    Reload(String),
+}
 
+async fn lua_main() -> Result<(), Error> {
+    let (manager_tx, mut manager_rx) = mpsc::channel(128);
     // in game chat command listener
-    let vm_manager1 = vm_manager.clone();
+    let tx1 = manager_tx.clone();
     let mut hook_input_dispatch = mhw_toolkit::game::hooks::InputDispatchHook::new();
     hook_input_dispatch
         .set_hook(CallbackPosition::Before, move |input| {
@@ -158,27 +167,88 @@ async fn lua_main() -> Result<(), Error> {
             } else if inputs[1] == "reload" {
                 if inputs.len() < 3 {
                     // reload all
-                    if let Err(e) = vm_manager1.lock().unwrap().reload_all() {
+                    if let Err(e) = tx1.blocking_send(ManagerEvent::ReloadAll) {
+                        error!("reload all error: {}", e);
+                    };
+                } else {
+                    // reload specified
+                    if let Err(e) = tx1.blocking_send(ManagerEvent::Reload(inputs[2].to_string())) {
+                        error!("reload `{}` error: {}", inputs[2], e)
+                    };
+                }
+            }
+        })
+        .map_err(|e| hooks::HookError::Hook {
+            source: e,
+            reason: "Failed to set input dispatch hook".to_string(),
+        })
+        .context(HookSnafu)?;
+
+    // init basic services
+    hooks::monster::init_monster_hooks().context(HookSnafu)?;
+
+    // start lua main thread
+    let vm_manager = Arc::new(Mutex::new(LuaManager::new()));
+    // let handle = Handle::current();
+    // thread::spawn(move || {
+    //     handle.block_on(async {
+    //         vm_manager.lock().await.load_all()?;
+    //         vm_manager.lock().await.run_all().await?;
+    //         while let Some(event) = manager_rx.recv().await {
+    //             match event {
+    //                 ManagerEvent::ReloadAll => {
+    //                     if let Err(e) = vm_manager.lock().await.reload_all().await {
+    //                         error!("reload error: {}", e);
+    //                     } else {
+    //                         info!("reload all successfully");
+    //                     }
+    //                 }
+    //                 ManagerEvent::Reload(name) => {
+    //                     if let Err(e) = vm_manager.lock().await.reload(&name).await {
+    //                         error!("reload error: {}", e);
+    //                     } else {
+    //                         info!("reload {} successfully", name);
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //     });
+    // });
+    if let Err(e) = vm_manager.lock().await.load_all().await {
+        error!("load error: {}", e);
+    };
+    if let Err(e) = vm_manager.lock().await.run_all().await {
+        error!("run error: {}", e);
+    };
+
+    debug!("start command recv");
+    loop {
+        if let Some(event) = manager_rx.recv().await {
+            match event {
+                ManagerEvent::ReloadAll => {
+                    error!("reload all");
+                    if let Err(e) = vm_manager.lock().await.reload_all().await {
                         error!("reload error: {}", e);
                     } else {
                         info!("reload all successfully");
                     }
-                } else {
-                    // reload specified
-                    if let Err(e) = vm_manager1.lock().unwrap().reload(inputs[2]) {
+                }
+                ManagerEvent::Reload(name) => {
+                    if let Err(e) = vm_manager.lock().await.reload(&name).await {
                         error!("reload error: {}", e);
                     } else {
-                        info!("reload {} successfully", inputs[2]);
+                        info!("reload {} successfully", name);
                     }
                 }
             }
-        })
-        .map_err(|e| Error::Hook {
-            reason: e.to_string(),
-        })?;
+        } else {
+            error!("Command handler channel closed");
+            break;
+        }
+    }
 
-    vm_manager.lock().unwrap().load_all()?;
-    vm_manager.lock().unwrap().run_all()?;
+    // start module services
+    // tokio::spawn(async move {});
 
     Ok(())
 }
@@ -190,10 +260,8 @@ fn main_entry() -> Result<(), Error> {
         .enable_all()
         .build()
         .context(IoSnafu)?;
-    let _ = runtime.block_on(async {
-        tokio::spawn(async move { lua_main().await });
-
-        tokio::signal::ctrl_c().await
+    runtime.block_on(async {
+        let _ = lua_main().await;
     });
 
     Ok(())

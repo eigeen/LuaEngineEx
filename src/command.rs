@@ -55,6 +55,11 @@ mod tests {
     fn test_debug_vm() {
         let inputs = "/lua debug vm".split_whitespace().collect::<Vec<&str>>();
         let cli = Cli::try_parse_from(inputs).unwrap();
-        assert_eq!(cli.command, Command::Debug { command: DebugCommand::Vm });
+        assert_eq!(
+            cli.command,
+            Command::Debug {
+                command: DebugCommand::Vm
+            }
+        );
     }
 }
